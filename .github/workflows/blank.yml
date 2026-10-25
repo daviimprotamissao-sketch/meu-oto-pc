@@ -1,0 +1,106 @@
+name: Windows RDP + Tailscale (GitHub-hosted)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-rdp
+  cancel-in-progress: false
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 355   # limite do GitHub para runners hospedados: 360 min
+    defaults:
+      run:
+        shell: powershell
+    env:
+      RDP_USER: ${{ secrets.RDP_USER }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+
+    steps:
+      - name: 1. Core do RDP
+        run: |
+          $ts = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          Set-ItemProperty $ts -Name fDenyTSConnections -Value 0
+          Set-ItemProperty "$ts\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+          # Libera a porta 3389 apenas para a rede do Tailscale
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Protocol TCP `
+            -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Action Allow | Out-Null
+
+      - name: 2. Instalar o Tailscale
+        run: |
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Set-Service Tailscale -StartupType Automatic
+          Start-Service Tailscale
+
+      - name: 3. Conectar e estabilizar o Tailscale
+        run: |
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          & $exe up --authkey=$env:TS_AUTHKEY --unattended --hostname=gh-win-rdp
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up falhou." }
+          $state = ""
+          for ($i = 0; $i -lt 30; $i++) {
+            $state = (& $exe status --json | ConvertFrom-Json).BackendState
+            if ($state -eq "Running") { break }
+            Start-Sleep -Seconds 2
+          }
+          if ($state -ne "Running") { throw "Tailscale não ficou Running (estado: $state)." }
+          $ip = & $exe ip -4 | Select-Object -First 1
+          if (-not $ip) { throw "Tailscale não obteve IP." }
+          "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+          Write-Host "Tailscale IP: $ip"
+
+      - name: 4. Usuário do RDP (grupo Administradores)
+        run: |
+          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $env:RDP_USER -Password $pw -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name $env:RDP_USER -Password $pw
+          }
+          # SIDs funcionam em qualquer idioma do Windows
+          Add-LocalGroupMember -SID S-1-5-32-544 -Member $env:RDP_USER -ErrorAction SilentlyContinue  # Administradores
+          Add-LocalGroupMember -SID S-1-5-32-555 -Member $env:RDP_USER -ErrorAction SilentlyContinue  # Usuários da Área de Trabalho Remota
+
+      - name: 5. Chaves do Registro (GPU, apps fora da Store, VerboseStatus)
+        run: |
+          function Set-Reg($path, $name, $value, $type = "DWord") {
+            if (-not (Test-Path $path)) { New-Item $path -Force | Out-Null }
+            New-ItemProperty $path -Name $name -Value $value -PropertyType $type -Force | Out-Null
+          }
+          # Só têm efeito se o runner tiver GPU (runners padrão não têm)
+          $tsp = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          Set-Reg $tsp "bEnumerateHWBeforeSW" 1
+          Set-Reg $tsp "AVC444ModePreferred" 1
+          Set-Reg $tsp "AVCHardwareEncodePreferred" 1
+          # Permitir instalar apps/jogos de qualquer lugar (fora da Microsoft Store)
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "AicEnabled" "Anywhere" "String"
+          # Mensagens detalhadas no boot/logon/desligamento
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "VerboseStatus" 1
+
+      - name: 6. Verificar acessibilidade do RDP
+        run: |
+          $r = Test-NetConnection -ComputerName $env:TS_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $r.TcpTestSucceeded) { throw "RDP inacessível em $($env:TS_IP):3389" }
+          Write-Host "RDP OK em $($env:TS_IP):3389"
+
+      - name: 7. Conexão final
+        run: |
+          Write-Host "============================================"
+          Write-Host " mstsc /v:$($env:TS_IP)"
+          Write-Host " Usuário: $env:RDP_USER"
+          Write-Host " Para encerrar antes: crie C:\stop.txt na VM"
+          Write-Host "============================================"
+
+      - name: 8. Manter o job vivo (até o limite do GitHub)
+        run: |
+          $end = (Get-Date).AddMinutes(345)
+          while ((Get-Date) -lt $end -and -not (Test-Path "C:\stop.txt")) {
+            Start-Sleep -Seconds 30
+          }
